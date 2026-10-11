@@ -161,7 +161,7 @@ class Notifications(unittest.TestCase):
         rows = [activity(end_time=None)]
         z.assessments.side_effect = lambda cid, types: [r for r in rows if r["type"] in types]
         args = argparse.Namespace(course=[], all=False, type=["exam", "homework"], due_within=30,
-                                  init=True, json=True, in_class=False, margin=10)
+                                  init=True, json=True, in_class=False, margin=10, outbox=None)
 
         def run():
             with redirect_stdout(io.StringIO()) as out:
@@ -189,7 +189,7 @@ class Notifications(unittest.TestCase):
         z.user_id.return_value = 1
         z.assessments.return_value = []
         args = argparse.Namespace(course=[], all=False, type=["homework"], due_within=30, init=False, json=True,
-                                  in_class=True, margin=10)
+                                  in_class=True, margin=10, outbox=None)
         sub = {"course_name": "测试课程", "begin": 1000, "over": 2000}
         with tempfile.TemporaryDirectory() as d, mock.patch.object(zju, "STATE_DIR", Path(d)), \
                 mock.patch.object(zju, "Zju", return_value=z), mock.patch.object(zju, "today_subs", return_value=[sub]):
@@ -206,13 +206,52 @@ class Notifications(unittest.TestCase):
             with mock.patch("time.time", return_value=1500), redirect_stdout(io.StringIO()):
                 zju.cmd_notify(args)
             self.assertEqual([c.args[0] for c in z.assessments.call_args_list], [10, 11])
+            z.assessments.reset_mock()
+            alias = {"course_name": "课表里的别名", "begin": 1000, "over": 2000}
+            sub["course_name"] = "测试课程"  # 两门课重叠、其中一门对不上：也全查
+            with mock.patch.object(zju, "today_subs", return_value=[sub, alias]), \
+                    mock.patch("time.time", return_value=1500), redirect_stdout(io.StringIO()):
+                zju.cmd_notify(args)
+            self.assertEqual([c.args[0] for c in z.assessments.call_args_list], [10, 11])
+
+    def test_outbox_is_written_with_state_and_survives_broken_output(self):
+        z = mock.Mock()
+        z.courses.return_value = [COURSE]
+        z.user_id.return_value = 1
+        z.assessments.return_value = [activity(end_time=None)]
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(zju, "STATE_DIR", Path(d)), \
+                mock.patch.object(zju, "Zju", return_value=z):
+            box = Path(d) / "out.json"
+            args = argparse.Namespace(course=[], all=False, type=["homework"], due_within=30, init=False,
+                                      json=True, in_class=False, margin=10, outbox=str(box))
+            box.write_text("broken")
+            with redirect_stdout(io.StringIO()), self.assertRaises(zju.ZjuError):
+                zju.cmd_notify(args)
+            self.assertFalse((Path(d) / "notifications-1.json").exists())
+            box.write_text('[{"id": 0}]')
+            with redirect_stdout(io.StringIO()):
+                zju.cmd_notify(args)
+            self.assertEqual([e["id"] for e in json.loads(box.read_text())], [0, 1])
+            with redirect_stdout(io.StringIO()):
+                zju.cmd_notify(args)  # 没有新事件时不动队列
+            self.assertEqual(len(json.loads(box.read_text())), 2)
+
+    def test_day_subs_error_is_not_an_empty_timetable(self):
+        z = zju.Zju.__new__(zju.Zju)
+        with mock.patch.object(z, "ensure"), mock.patch.object(z, "bearer", return_value={}):
+            for r in (response({"error": "forbidden"}, 403), response({"code": 1, "msg": "x"}),
+                      response({"code": 0})):
+                with mock.patch.object(z, "get", return_value=r), self.assertRaises(zju.ZjuError):
+                    z.day_subs(dt.date(2026, 10, 12))
+            with mock.patch.object(z, "get", return_value=response({"code": 0, "list": []})):
+                self.assertEqual(z.day_subs(dt.date(2026, 10, 12)), [])
 
     def test_command_failure_does_not_consume_any_events(self):
         z = mock.Mock()
         z.courses.return_value = [COURSE, {**COURSE, "id": 11}]
         z.user_id.return_value = 1
         args = argparse.Namespace(course=[], all=False, type=["homework"], due_within=30, init=False, json=True,
-                                  in_class=False, margin=10)
+                                  in_class=False, margin=10, outbox=None)
         with tempfile.TemporaryDirectory() as d, mock.patch.object(zju, "STATE_DIR", Path(d)), \
                 mock.patch.object(zju, "Zju", return_value=z):
             z.assessments.side_effect = [[activity(end_time=None)], zju.ZjuError("API failed")]
@@ -231,7 +270,7 @@ class Notifications(unittest.TestCase):
         z.user_id.return_value = 1
         z.assessments.return_value = [activity(end_time=None)]
         args = argparse.Namespace(course=[], all=False, type=["homework"], due_within=30, init=False, json=True,
-                                  in_class=False, margin=10)
+                                  in_class=False, margin=10, outbox=None)
         with tempfile.TemporaryDirectory() as d, mock.patch.object(zju, "STATE_DIR", Path(d)), \
                 mock.patch.object(zju, "Zju", return_value=z), \
                 mock.patch("sys.stdout", **{"write.side_effect": BrokenPipeError()}):

@@ -622,11 +622,16 @@ class Zju:
 
     def day_subs(self, day: dt.date) -> list[dict]:
         self.ensure(need_classroom=True)
-        j = self.json(self.get("https://classroom.zju.edu.cn/courseapi/v2/course-live/get-my-course-day",
-                               headers=self.bearer(), params={"day": day.isoformat()}), "course-day")
+        r = self.get("https://classroom.zju.edu.cn/courseapi/v2/course-live/get-my-course-day",
+                     headers=self.bearer(), params={"day": day.isoformat()})
+        j = self.json(r, "course-day")
+        # 出错时也是 JSON：不能当成"今天没课"，否则 today_subs 会把空课表缓存一整天
+        if (not r.ok or not isinstance(j, dict) or j.get("code", 0) != 0
+                or not isinstance(j.get("list"), (dict, list))):
+            raise ZjuError(f"智云课表查询失败（HTTP {r.status_code}）：{str(j)[:200]}")
         subs = []
-        lst = j.get("list")
-        for d in (lst.values() if isinstance(lst, dict) else lst or []):
+        lst = j["list"]
+        for d in (lst.values() if isinstance(lst, dict) else lst):
             for c in d.get("course", []):
                 subs.append({"course_id": int(c["id"]), "course_name": c["title"], "sub_id": int(c["sub_id"]),
                              "sub_name": c["sub_title"], "lecturer": c.get("realname", ""),
@@ -920,6 +925,28 @@ def assessment_notifications(course: dict, rows: list[dict], seen: dict, now: dt
                            "course_id": course["id"], "course_name": course["name"], "reasons": reasons,
                            **{k: current[k] for k in ("status", "start_time", "end_time")}})
     return events
+
+
+def append_outbox(path: Path, events: list[dict]):
+    """追加到外部推送程序的待发送队列（JSON 数组，原子写入）；推送成功后由推送程序删除。"""
+    try:
+        queue = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        queue = []
+    except ValueError as e:
+        raise ZjuError(f"待发送队列 {path} 格式错误，请备份后移走再运行") from e
+    if not isinstance(queue, list):
+        raise ZjuError(f"待发送队列 {path} 格式错误，请备份后移走再运行")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(queue + events, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
 
 
 @contextmanager
@@ -1290,9 +1317,11 @@ def cmd_notify(a):
             return
         log("上课中：" + "、".join(f"{s['course_name']} {class_span(s)}" for s in now_subs))
     courses = match_courses(z.courses(), a.course, a.all)
-    if now_subs:  # 课上小测只会发在正在上的课；课表名和课程名对不上时退回全查
+    if now_subs:  # 课上小测只会发在正在上的课；有任何一门课表名对不上就退回全查
         names = {s["course_name"].strip() for s in now_subs}
-        courses = [c for c in courses if c["name"].strip() in names] or courses
+        hit = [c for c in courses if c["name"].strip() in names]
+        if names <= {c["name"].strip() for c in hit}:
+            courses = hit
     if not courses:
         raise ZjuError("没有符合的课程（用 courses --all 看 id）")
     try:
@@ -1306,6 +1335,8 @@ def cmd_notify(a):
             if a.init:
                 events = []
                 log("通知记录已初始化，当前项目不输出提醒；后续新增、开放或时间变更仍会提醒")
+            if a.outbox and events:  # 先落盘待发送事件，再保存去重记录：中途失败不会丢提醒
+                append_outbox(Path(a.outbox).expanduser(), events)
             if a.json:
                 print(json.dumps(events, ensure_ascii=False, indent=1))
             else:
@@ -1672,6 +1703,8 @@ def main():
     x.add_argument("--in-class", action="store_true",
                    help="只在今天课表的上课时段查，且只查正在上的课（给定时任务用）")
     x.add_argument("--margin", type=int, default=10, metavar="MIN", help="上课前后各放宽几分钟（默认 10）")
+    x.add_argument("--outbox", metavar="FILE",
+                   help="同时把事件追加到这个 JSON 队列，与去重记录一起落盘（给外部推送程序，发送成功后自行删除）")
     x.add_argument("--json", action="store_true", help="输出事件数组；没有新提醒时为 []")
     x.set_defaults(fn=cmd_notify)
 

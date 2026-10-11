@@ -15,6 +15,7 @@ API 逻辑移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py courses [--all]               # 学在浙大课程列表
   zju.py sync [课程...] [--dry-run]     # 增量同步课程附件（含定时发布的活动）
   zju.py todo                          # 待办
+  zju.py notify [课程...] [--json]      # 测验／作业新增、开放、时间变更和临近截止提醒
   zju.py activities [课程...] [--type forum homework ...]  # 所有活动（含测验）
   zju.py show <活动id> [--read]         # 活动详情；作业显示自己的提交状态；--read 打印附件文字
   zju.py forum list|read|post|reply ... # 讨论区
@@ -45,6 +46,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 
@@ -466,6 +468,36 @@ class Zju:
             acts += [dict(e, type="exam") for e in self.json(r, "exams").get("exams", [])]
         return acts
 
+    def assessments(self, course_id: int, types: list[str]) -> list[dict]:
+        """提醒用的完整作业／测验列表；失败不能当成空列表。"""
+        self.ensure()
+        out = {}
+        for kind in dict.fromkeys(types):
+            route, key = ("homework-activities", "homework_activities") if kind == "homework" else ("exams", "exams")
+            page = 1
+            while True:
+                params = {"page": page, "page_size": 100}
+                if kind == "homework":
+                    params.update(conditions='{"itemsSortBy":{"predicate":"module","reverse":false}}',
+                                  reloadPage="false")
+                r = self.get(f"{LMS}/api/courses/{course_id}/{route}", params=params)
+                if not r.ok:
+                    raise ZjuError(f"课程 {course_id} {route} 查询失败：HTTP {r.status_code}")
+                data = self.json(r, route)
+                if not isinstance(data, dict) or not isinstance(data.get(key), list):
+                    raise ZjuError(f"课程 {course_id} {route} 响应缺少 {key} 列表")
+                for row in data[key]:
+                    if not isinstance(row, dict) or row.get("id") is None:
+                        raise ZjuError(f"课程 {course_id} {route} 返回无效活动")
+                    out[(kind, str(row["id"]))] = dict(row, type=kind)
+                pages = data.get("pages") or 1  # exams 当前不分页；空作业列表的 pages 为 0
+                if not isinstance(pages, int) or pages < 1:
+                    raise ZjuError(f"课程 {course_id} {route} 返回无效分页信息")
+                if page >= pages:
+                    break
+                page += 1
+        return list(out.values())
+
     def activity(self, aid: int) -> dict:
         self.ensure()
         r = self.get(f"{LMS}/api/activities/{aid}")
@@ -827,6 +859,121 @@ def act_status(a: dict) -> str:
     return "进行中"
 
 
+NOTIFY_REASONS = {"new": "新发现", "opened": "已开放", "schedule_changed": "时间变更", "due": "即将截止"}
+ASSESSMENT_STATUSES = {"unpublished", "closed", "submitted", "upcoming", "open"}
+
+
+def assessment_time(value: str | None) -> dt.datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, AttributeError) as e:
+        raise ZjuError(f"无法解析活动时间：{value!r}") from e
+    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=CST)).astimezone(dt.timezone.utc)
+
+
+def assessment_snapshot(row: dict, now: dt.datetime) -> dict:
+    start = assessment_time(row.get("start_time"))
+    end = assessment_time(row.get("end_time") or row.get("deadline"))
+    if row.get("published") is False or row.get("is_published") is False:
+        status = "unpublished"
+    elif row.get("is_closed") or (end and end <= now):
+        status = "closed"
+    elif row.get("submitted") is True or row.get("is_submitted") is True:
+        status = "submitted"
+    elif row.get("is_started") is False or (start and start > now):
+        status = "upcoming"
+    else:
+        status = "open"
+    return {"status": status, "start_time": start.isoformat() if start else None,
+            "end_time": end.isoformat() if end else None}
+
+
+def assessment_notifications(course: dict, rows: list[dict], seen: dict, now: dt.datetime,
+                             due_within: int) -> list[dict]:
+    """按课程、类型和 ID 去重；seen 是本轮内存副本，全部查询成功后才保存。"""
+    events = []
+    for row in rows:
+        key = f"{course['id']}:{row['type']}:{row['id']}"
+        previous = seen.get(key)
+        current = assessment_snapshot(row, now)
+        current["due_end"] = previous.get("due_end") if previous else None
+        reasons = []
+        if current["status"] in ("upcoming", "open"):
+            if previous is None or previous["status"] == "unpublished":
+                reasons.append("new")
+            else:
+                if current["status"] == "open" and previous["status"] != "open":
+                    reasons.append("opened")
+                if any(current[k] != previous[k] for k in ("start_time", "end_time")):
+                    reasons.append("schedule_changed")
+            end = assessment_time(current["end_time"])
+            if (current["status"] == "open" and due_within > 0 and end
+                    and dt.timedelta(0) < end - now <= dt.timedelta(minutes=due_within)
+                    and current["due_end"] != current["end_time"]):
+                reasons.append("due")
+                current["due_end"] = current["end_time"]
+        seen[key] = current
+        if reasons:
+            events.append({"id": row["id"], "type": row["type"], "title": row.get("title", ""),
+                           "course_id": course["id"], "course_name": course["name"], "reasons": reasons,
+                           **{k: current[k] for k in ("status", "start_time", "end_time")}})
+    return events
+
+
+@contextmanager
+def notification_state(user_id: int):
+    """按用户隔离，进程锁防止定时任务重叠；输出成功后原子保存。"""
+    path = state_dir() / f"notifications-{user_id}.json"
+    fd = os.open(path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "r+b") as lock:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                if not os.fstat(lock.fileno()).st_size:
+                    lock.write(b"\0")
+                    lock.flush()
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            raise ZjuError("另一个 notify 正在运行，请等它结束后重试") from e
+        try:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                data = {"version": 1, "items": {}}
+            except ValueError as e:
+                raise ZjuError(f"通知记录 {path} 格式错误，请备份后移走再运行") from e
+            if (not isinstance(data, dict) or data.get("version") != 1
+                    or not isinstance(data.get("items"), dict)
+                    or any(not isinstance(v, dict) or not isinstance(v.get("status"), str)
+                           or v["status"] not in ASSESSMENT_STATUSES
+                           or any(k not in v or (v[k] is not None and not isinstance(v[k], str))
+                                  for k in ("start_time", "end_time", "due_end"))
+                           for v in data["items"].values())):
+                raise ZjuError(f"通知记录 {path} 格式错误，请备份后移走再运行")
+            yield data["items"]
+            fd, tmp = tempfile.mkstemp(prefix=".notifications-", dir=path.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=1)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
+            finally:
+                Path(tmp).unlink(missing_ok=True)
+        finally:
+            if sys.platform == "win32":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def read_body(a) -> str:
     """--body 文字或 --body-file 文件（- = stdin）。"""
     if a.body_file:
@@ -1127,6 +1274,50 @@ def cmd_todo(a):
     for t in sorted(ts, key=lambda t: t.get("end_time") or ""):
         end = local_time(t.get("end_time"), "%Y-%m-%d %H:%M")  # API 给 UTC
         print(f"{end}\t{t.get('course_name', '')}\t{t.get('title', '')}\t{t.get('type', '')}")
+
+
+def cmd_notify(a):
+    if a.due_within < 0:
+        raise ZjuError("--due-within 不能为负数（0 = 不提醒临近截止）")
+    z = Zju()
+    now_subs = None
+    if a.in_class:
+        now_subs = in_class(today_subs(z), time.time(), a.margin)
+        if not now_subs:
+            log("现在不是上课时段，跳过")
+            if a.json:
+                print("[]")
+            return
+        log("上课中：" + "、".join(f"{s['course_name']} {class_span(s)}" for s in now_subs))
+    courses = match_courses(z.courses(), a.course, a.all)
+    if now_subs:  # 课上小测只会发在正在上的课；课表名和课程名对不上时退回全查
+        names = {s["course_name"].strip() for s in now_subs}
+        courses = [c for c in courses if c["name"].strip() in names] or courses
+    if not courses:
+        raise ZjuError("没有符合的课程（用 courses --all 看 id）")
+    try:
+        with notification_state(z.user_id()) as seen:
+            now = dt.datetime.now(dt.timezone.utc)
+            events = []
+            for course in courses:
+                rows = z.assessments(course["id"], a.type)
+                events.extend(assessment_notifications(course, rows, seen, now, a.due_within))
+            events.sort(key=lambda e: (e["end_time"] or "9999", str(e["course_id"]), e["type"], str(e["id"])))
+            if a.init:
+                events = []
+                log("通知记录已初始化，当前项目不输出提醒；后续新增、开放或时间变更仍会提醒")
+            if a.json:
+                print(json.dumps(events, ensure_ascii=False, indent=1))
+            else:
+                for e in events:
+                    reasons = "、".join(NOTIFY_REASONS[r] for r in e["reasons"])
+                    start = local_time(e["start_time"], "%Y-%m-%d %H:%M")
+                    end = local_time(e["end_time"], "%Y-%m-%d %H:%M")
+                    print(f"[{reasons}]\t{e['course_name']}\t{ACT_TYPES[e['type']]}\t{e['title']}"
+                          f"\t开放 {start}\t截止 {end}\t课程 {e['course_id']} / 活动 {e['id']}")
+            sys.stdout.flush()  # 管道输出失败时不把提醒记成已发送
+    except OSError as e:
+        raise ZjuError(f"通知输出或记录读写失败：{e}") from e
 
 
 def cmd_activities(a):
@@ -1469,6 +1660,20 @@ def main():
     x = sp.add_parser("todo", help="待办事项")
     x.add_argument("--json", action="store_true")
     x.set_defaults(fn=cmd_todo)
+
+    x = sp.add_parser("notify", help="测验／作业提醒：新增、开放、时间变更、临近截止（本地去重）")
+    x.add_argument("course", nargs="*", help="课程 id 或名称片段；省略 = 最新学年所有课程")
+    x.add_argument("--all", action="store_true", help="没指定课程时含往年课程")
+    x.add_argument("--type", nargs="+", choices=["exam", "homework"], default=["exam", "homework"],
+                   help="监测类型（默认两者都查，包括以作业形式发布的小测）")
+    x.add_argument("--due-within", type=int, default=30, metavar="MINUTES",
+                   help="截止前多少分钟提醒一次（默认 30，0 = 关闭）")
+    x.add_argument("--init", action="store_true", help="仅建立当前范围的记录，不输出现有项目的提醒")
+    x.add_argument("--in-class", action="store_true",
+                   help="只在今天课表的上课时段查，且只查正在上的课（给定时任务用）")
+    x.add_argument("--margin", type=int, default=10, metavar="MIN", help="上课前后各放宽几分钟（默认 10）")
+    x.add_argument("--json", action="store_true", help="输出事件数组；没有新提醒时为 []")
+    x.set_defaults(fn=cmd_notify)
 
     x = sp.add_parser("activities", help="列出课程活动（课件／视频／作业／讨论／测验…）")
     x.add_argument("course", nargs="*", help="课程 id 或名称片段；省略 = 最新学年所有课程")

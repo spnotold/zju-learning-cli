@@ -182,6 +182,33 @@ class Notifications(unittest.TestCase):
             args.type = ["homework", "exam"]
             self.assertEqual(run(), [])
 
+    def test_cli_accepts_push_script_arguments_and_writes_outbox(self):
+        # 从命令行入口验证定时推送脚本的参数，避免只测 Namespace 而漏掉 --outbox 未注册。
+        for in_class in (False, True):
+            with self.subTest(in_class=in_class), tempfile.TemporaryDirectory() as d:
+                box = Path(d) / "outbox.json"
+                argv = ["zju.py", "notify", "--json", "--due-within", "150", "--outbox", str(box)]
+                if in_class:
+                    argv.append("--in-class")
+                z = mock.Mock()
+                z.courses.return_value = [COURSE]
+                z.user_id.return_value = 1
+                z.assessments.return_value = [activity(end_time=None)]
+                sub = {"course_name": COURSE["name"], "begin": 1000, "over": 2000}
+                with mock.patch.object(zju.sys, "argv", argv), \
+                        mock.patch.object(zju, "load_config", return_value={}), \
+                        mock.patch.object(zju, "STATE_DIR", Path(d)), \
+                        mock.patch.object(zju, "Zju", return_value=z), \
+                        mock.patch.object(zju, "today_subs", return_value=[sub]), \
+                        mock.patch.object(zju.time, "time", return_value=1500), \
+                        mock.patch.object(zju, "log"), redirect_stdout(io.StringIO()) as out:
+                    zju.main()
+                events = json.loads(out.getvalue())
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["id"], 1)
+                self.assertEqual(json.loads(box.read_text()), events)
+                z.assessments.assert_called_once_with(COURSE["id"], ["exam", "homework"])
+
     def test_in_class_skips_api_and_narrows_to_current_course(self):
         z = mock.Mock()
         other = {**COURSE, "id": 11, "name": "别的课"}

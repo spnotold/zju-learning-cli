@@ -23,9 +23,9 @@
 | `zju classroom search 关键词` | 在智云课堂找课，取得 `course_id` |
 | `zju classroom subs <course_id>` | 列出该课每一堂的 `sub_id` |
 | `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的课，含追踪中的课 |
-| `zju classroom add\|rm <course_id>...` | 追踪课表外的课（申请听课核准的）。智云的课表 API 只返回自己选的班，追踪后 `classroom day`、`ppt --days`、`transcript --days` 都会带上，输出文件夹为“课名 老师”避免和自己那班撞名 |
+| `zju classroom add\|rm <course_id>...` | 追踪课表外的课（听课申请已获批准的）。智云的课表 API 只返回自己选的班，追踪后 `classroom day`、`ppt --days`、`transcript --days` 都会带上，输出文件夹为“课名 老师”避免和自己那班撞名 |
 | `zju classroom tracked` | 列出追踪中的课 |
-| `zju rollcall [--in-class] [--json]` | 列出进行中的签到（只查看、不代签）；`--in-class` 只在课表的上课时段才查，给定时提醒用 |
+| `zju rollcall [--in-class] [--json]` | 列出进行中的签到（只查看、不代签）；`--in-class` 只在当天课表的上课时段查询（默认前后各放宽 10 分钟，可用 `--margin` 调整），给定时提醒用 |
 | `zju ppt --course <id> \| --days N [--dedup]` | 智云 PPT 截图 → `<课程>/智云PPT/<堂>.pdf` |
 | `zju transcript --course <id> \| --days N` | 语音转录 → `<课程>/转录/<堂>.txt\|srt\|md` |
 

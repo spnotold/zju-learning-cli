@@ -23,7 +23,7 @@ API 逻辑移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py classroom search 关键词        # 智云课堂找课（id 与学在浙大不同）
   zju.py classroom subs <cid>          # 列出每堂课
   zju.py classroom day [日期] [--days N]   # 课表的课＋追踪中的旁听课
-  zju.py classroom add|rm <cid>...      # 追踪课表外的课（申请听课核准的），--days 也会抓
+  zju.py classroom add|rm <cid>...      # 追踪课表外的课（听课申请已获批准的），--days 也会抓
   zju.py classroom tracked             # 列出追踪中的课
   zju.py rollcall [--in-class] [--json]  # 签到提醒用：只列出进行中的签到，不代签
   zju.py ppt --course <cid> | --days N [--dedup]  # 智云 PPT 截图合并 PDF
@@ -258,7 +258,7 @@ class Zju:
             try:
                 r = self.s.request(method, url, **kw)
             except requests.exceptions.SSLError as e:
-                raise ZjuError(f"TLS 验证失败（网络可能被拦截，或学校凭证有问题）：{url}\n{e}")
+                raise ZjuError(f"TLS 验证失败（网络可能被拦截，或学校证书有问题）：{url}\n{e}")
             except (requests.exceptions.ConnectTimeout, requests.exceptions.ProxyError) as e:
                 last = e
             except (requests.ConnectionError, requests.Timeout) as e:
@@ -453,7 +453,7 @@ class Zju:
             self.ensure()
             m = re.search(r'ng-init="userId=(\d+);', self.get(f"{LMS}/user/index").text)
             if not m:
-                raise ZjuError("抓不到自己的 user id（/user/index 改版？）")
+                raise ZjuError("无法获取自己的用户 ID（/user/index 改版？）")
             self._uid = int(m.group(1))
         return self._uid
 
@@ -507,7 +507,7 @@ class Zju:
         if "upload_url" not in pre:
             raise ZjuError(f"上传登记失败：{pre}")
         if pre.get("storage_type") in ("S3", "QINIU"):
-            raise ZjuError(f"保存后端 {pre['storage_type']} 尚未支持（学校改了上传方式）")
+            raise ZjuError(f"存储后端 {pre['storage_type']} 尚未支持（学校改了上传方式）")
         with path.open("rb") as f:
             r = self.req("PUT", pre["upload_url"], files={"file": (path.name, f)}, retry=False,
                          timeout=(6, 600))
@@ -749,7 +749,7 @@ def match_courses(courses: list[dict], keys: list[str], include_all: bool) -> li
 
 ACT_TYPES = {
     "material": "课件", "online_video": "视频", "homework": "作业", "forum": "讨论", "exam": "测验",
-    "page": "网页", "web_link": "链接", "questionnaire": "问卷", "classroom": "课堂交互",
+    "page": "网页", "web_link": "链接", "questionnaire": "问卷", "classroom": "课堂互动",
     "lesson": "直播", "vocabulary": "单词", "survey": "调查", "chatroom": "聊天室",
 }
 
@@ -953,7 +953,7 @@ def dedup_slides(paths: list[Path], max_lost_cells: int = 2) -> list[Path]:
 
 def tracked_courses() -> dict[str, str]:
     """config.json 的 tracked_courses：{智云 course_id: 显示名}。
-    申请听课核准的课不在 get-my-course-day（只返回课表），智云也没有“我的申请”列表 API，只能自己记。"""
+    听课申请已获批准的课不在 get-my-course-day（只返回课表），智云也没有“我的申请”列表 API，只能自己记。"""
     return load_config().get("tracked_courses") or {}
 
 

@@ -1,4 +1,4 @@
-"""不連網的單元測試：python -m unittest discover tests（需 requests / img2pdf / pillow / numpy）。"""
+"""不联网的单元测试：python -m unittest discover tests（需 requests / img2pdf / pillow / numpy）。"""
 import importlib.util
 import tempfile
 import unittest
@@ -12,7 +12,7 @@ spec.loader.exec_module(zju)
 
 class Offline(unittest.TestCase):
     def test_rsa_no_padding_roundtrip(self):
-        # 與 CAS 前端同一套 textbook RSA：m^e mod n，hex 輸出
+        # 与 CAS 前端同一套 textbook RSA：m^e mod n，hex 输出
         p, q, e = 1000000007, 998244353, 65537
         n = p * q
         d = pow(e, -1, (p - 1) * (q - 1))
@@ -30,9 +30,9 @@ class Offline(unittest.TestCase):
         def slide(lines, ink=None, bg=255):
             im = Image.new("RGB", (1280, 720), (bg,) * 3)
             d = ImageDraw.Draw(im)
-            for x, y, w in lines:  # 一行字 ≈ 一條細橫線
+            for x, y, w in lines:  # 一行字 ≈ 一条细横线
                 d.rectangle([x, y, x + w, y + 8], fill=(0, 0, 0))
-            if ink:  # 老師的紅筆註記
+            if ink:  # 老师的红笔批注
                 d.line(ink, fill=(220, 0, 0), width=5)
             return im
 
@@ -41,12 +41,12 @@ class Offline(unittest.TestCase):
         b = [(100, 60, 400), (150, 250, 500), (150, 450, 600), (300, 600, 300)]
         scribble = [(700, 300), (900, 420), (1100, 300), (900, 200)]
         pages = [
-            slide(a_title),           # 0 動畫第一步 → 被 1 包含
+            slide(a_title),           # 0 动画第一步 → 被 1 包含
             slide(a_full),            # 1 保留
-            slide(b),                 # 2 → 被 3（寫了註記）包含
-            slide([], bg=0),          # 3 全黑過場
+            slide(b),                 # 2 → 被 3（写了批注）包含
+            slide([], bg=0),          # 3 全黑过场
             slide(b, ink=scribble),   # 4 保留
-            slide(b),                 # 5 擦掉註記的乾淨版 → 被 4 包含
+            slide(b),                 # 5 擦掉批注的干净版 → 被 4 包含
             slide(a_full),            # 6 翻回前面 → 被 1 包含
         ]
         with tempfile.TemporaryDirectory() as d:
@@ -63,7 +63,7 @@ class Offline(unittest.TestCase):
         self.assertEqual(out, "1\n00:01:01,500 --> 00:01:03,000\n你好\n\n")
 
     def test_local_time(self):
-        self.assertEqual(zju.local_time(None), "時間未定")
+        self.assertEqual(zju.local_time(None), "时间未定")
         self.assertRegex(zju.local_time("2026-09-27T15:59:00Z", "%Y-%m-%d"), r"2026-09-2[78]")
 
     def test_current_year(self):
@@ -76,7 +76,7 @@ class Offline(unittest.TestCase):
         from PIL import Image
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
-            Image.new("RGBA", (40, 30), (255, 0, 0, 128)).save(d / "a.png")  # alpha：走 Pillow 轉檔分支
+            Image.new("RGBA", (40, 30), (255, 0, 0, 128)).save(d / "a.png")  # alpha：走 Pillow 转换分支
             Image.new("RGB", (40, 30)).save(d / "b.jpg")
             zju.images_to_pdf([d / "a.png", d / "b.jpg"], d / "out.pdf")
             self.assertEqual((d / "out.pdf").read_bytes()[:5], b"%PDF-")
@@ -87,7 +87,7 @@ class Offline(unittest.TestCase):
         self.assertEqual(zju.safe_name("x . "), "x")
 
     def test_local_time_naive_is_beijing(self):
-        # 沒帶時區 = 北京時間；換算成 UTC+8 顯示應不變
+        # 没带时区 = 北京时间；换算成 UTC+8 显示应不变
         import datetime as dt
         naive = zju.local_time("2026-09-27 23:59:00", "%Y-%m-%d %H:%M")
         want = dt.datetime(2026, 9, 27, 23, 59, tzinfo=zju.CST).astimezone().strftime("%Y-%m-%d %H:%M")
@@ -98,7 +98,7 @@ class Offline(unittest.TestCase):
         self.assertEqual(zju.secure_url("http://example.com/a.jpg"), "http://example.com/a.jpg")
 
     def test_http_never_carries_cookies(self):
-        """.zju.edu.cn 的 SSO cookie 沒設 Secure：http:// 請求必須被剝掉 Cookie。"""
+        """.zju.edu.cn 的 SSO cookie 没设 Secure：http:// 请求必须被剥掉 Cookie。"""
         from unittest import mock
         import requests
         seen = {}
@@ -124,7 +124,7 @@ class Offline(unittest.TestCase):
             self.assertIn("SECRET", seen["headers"].get("Cookie", ""))
 
     def test_refer_params(self):
-        # 與前端 getDownloadRefer 同規則：classroom→classroom_activity、exam 不帶、其餘→learning_activity
+        # 与前端 getDownloadRefer 同规则：classroom→classroom_activity、exam 不带、其余→learning_activity
         self.assertEqual(zju.refer_params({"id": 1164596, "type": "online_video"}),
                          {"refer_id": 1164596, "refer_type": "learning_activity"})
         self.assertEqual(zju.refer_params({"id": 1159399, "type": "material"}),
@@ -136,7 +136,7 @@ class Offline(unittest.TestCase):
         self.assertIsNone(zju.refer_params(None))
 
     def test_upload_response_refer_fallback(self):
-        """排程未開放：前兩層 403、第 3 層帶 snake_case refer 回原檔，不再落到 preview PDF。"""
+        """定时发布未开放：前两层 403、第 3 层带 snake_case refer 拿到原文件，不再落到 preview PDF。"""
         import io
         import requests
         from unittest import mock
@@ -158,14 +158,14 @@ class Offline(unittest.TestCase):
         with mock.patch.object(zju.Zju, "get", fake_get):
             r, src = z.upload_response(2316787, 17939358, {"id": 1164596, "type": "online_video"})
         self.assertEqual(r.status_code, 200)
-        self.assertEqual(src, "排程原檔")
+        self.assertEqual(src, "未开放原文件")
         self.assertEqual(len(calls), 3)  # refer 成功就不需要 preview PDF
         self.assertTrue(calls[0][0].endswith("/reference/17939358/blob"))
         self.assertEqual(calls[2], ("https://courses.zju.edu.cn/api/uploads/2316787/blob",
                                     {"refer_id": 1164596, "refer_type": "learning_activity"}))
 
     def test_upload_response_no_refer_for_exam(self):
-        """exam 活動不帶 refer：只走原三層，exam 未開放時照樣 403 拋錯。"""
+        """exam 活动不带 refer：只走原三层，exam 未开放时照样 403 抛错。"""
         import io
         import requests
         from unittest import mock
@@ -183,7 +183,7 @@ class Offline(unittest.TestCase):
         with mock.patch.object(zju.Zju, "get", fake_get):
             with self.assertRaises(zju.DownloadError) as cm:
                 z.upload_response(1, 2, {"id": 9, "type": "exam"})
-        self.assertEqual(len(calls), 3)  # reference blob、uid blob、preview url（沒有 refer 層）
+        self.assertEqual(len(calls), 3)  # reference blob、uid blob、preview url（没有 refer 层）
         self.assertTrue(all("refer_id" not in (p or {}) for _, p in calls))
         self.assertEqual(cm.exception.codes, [403, 403, 403])
 
@@ -210,20 +210,20 @@ class Offline(unittest.TestCase):
                 zju.stream_to(resp(b"<html>", ctype="text/html; charset=utf-8"), d / "c.pdf")
             with self.assertRaises(zju.TooBig):
                 zju.stream_to(resp(b"x" * 10, 10), d / "d.bin", limit=5)
-            self.assertEqual(sorted(p.name for p in d.iterdir()), [])  # 失敗不留任何檔
+            self.assertEqual(sorted(p.name for p in d.iterdir()), [])  # 失败不留任何文件
             out = zju.stream_to(resp(b"%PDF-1.4 ok", 11), d / "e.pptx")
             self.assertEqual(out.name, "e.pptx.pdf")
 
 
     def test_in_class(self):
-        # 北京時間 2026-10-08 13:25–15:50 一堂（主機時區不影響）
+        # 北京时间 2026-10-08 13:25–15:50 一堂（主机时区不影响）
         b = int(zju.dt.datetime(2026, 10, 8, 13, 25, tzinfo=zju.CST).timestamp())
         subs = [{"sub_id": 1, "begin": b, "over": b + 145 * 60}, {"sub_id": 2, "begin": 0, "over": 0}]
         self.assertEqual(zju.class_span(subs[0]), "13:25-15:50")
         self.assertEqual(zju.class_span(subs[1]), "-")
-        self.assertEqual([s["sub_id"] for s in zju.in_class(subs, b - 5 * 60)], [1])  # 上課前 5 分
+        self.assertEqual([s["sub_id"] for s in zju.in_class(subs, b - 5 * 60)], [1])  # 上课前 5 分
         self.assertEqual(zju.in_class(subs, b - 11 * 60), [])
-        self.assertEqual([s["sub_id"] for s in zju.in_class(subs, b + 150 * 60)], [1])  # 下課後 5 分
+        self.assertEqual([s["sub_id"] for s in zju.in_class(subs, b + 150 * 60)], [1])  # 下课后 5 分
         self.assertEqual(zju.in_class(subs, b + 150 * 60, margin=0), [])
 
     def test_day_subs_times(self):
@@ -243,7 +243,7 @@ class Offline(unittest.TestCase):
         self.assertEqual(zju.class_span(s), "16:15-17:50")
 
     def test_rollcall_in_class_skips_api(self):
-        """不在上課時段：不打簽到 API；簽到只用 GET 列表，不送任何簽到請求。"""
+        """不在上课时段：不打签到 API；签到只用 GET 列表，不发任何签到请求。"""
         import argparse
         import io
         from contextlib import redirect_stdout
@@ -268,7 +268,7 @@ class Offline(unittest.TestCase):
                 mock.patch.object(z, "req", return_value=r) as req, redirect_stdout(io.StringIO()) as out:
             zju.cmd_rollcall(a)
         self.assertEqual([c.args[0] for c in req.call_args_list], ["GET"])
-        self.assertEqual(out.getvalue(), "9\tNLP\t數字\t未簽\tT\n")
+        self.assertEqual(out.getvalue(), "9\tNLP\t数字\t未签\tT\n")
 
     def test_today_cst(self):
         import datetime as dt

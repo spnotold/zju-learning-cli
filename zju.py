@@ -933,9 +933,13 @@ def assessment_notifications(course: dict, rows: list[dict], seen: dict, now: dt
     return events
 
 
+class LockBusy(Exception):
+    """file_lock(wait=False) 时锁被别的进程占着。"""
+
+
 @contextmanager
 def file_lock(path: Path, wait: bool = True):
-    """进程间互斥锁（flock／msvcrt）；wait=False 时拿不到锁抛 OSError。"""
+    """进程间互斥锁（flock／msvcrt）；wait=False 时拿不到锁抛 LockBusy，打不开锁文件等其他错误照常抛出。"""
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     with os.fdopen(fd, "r+b") as lock:
         if sys.platform == "win32":
@@ -944,10 +948,18 @@ def file_lock(path: Path, wait: bool = True):
                 lock.write(b"\0")
                 lock.flush()
             lock.seek(0)
-            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK if wait else msvcrt.LK_NBLCK, 1)
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK if wait else msvcrt.LK_NBLCK, 1)
+            except OSError as e:
+                if wait:
+                    raise
+                raise LockBusy() from e  # LK_NBLCK 拿不到锁时报 EDEADLOCK／EACCES
         else:
             import fcntl
-            fcntl.flock(lock, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as e:
+                raise LockBusy() from e
         try:
             yield
         finally:
@@ -993,7 +1005,7 @@ def notification_state(user_id: int):
     with ExitStack() as stack:
         try:
             stack.enter_context(file_lock(path.with_suffix(".lock"), wait=False))
-        except OSError as e:
+        except LockBusy as e:
             raise ZjuError("另一个 notify 正在运行，请等它结束后重试") from e
         try:
             data = json.loads(path.read_text(encoding="utf-8"))

@@ -250,6 +250,18 @@ class Notifications(unittest.TestCase):
             t.join(5)
             self.assertEqual(json.loads(box.read_text()), [2])
 
+    def test_unopenable_lock_is_not_reported_as_busy(self):
+        import errno
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(zju, "STATE_DIR", Path(d)):
+            with zju.notification_state(1):
+                with self.assertRaisesRegex(zju.ZjuError, "另一个 notify 正在运行"):
+                    with zju.notification_state(1):
+                        pass
+            with mock.patch("os.open", side_effect=PermissionError(errno.EACCES, "denied")):
+                with self.assertRaises(PermissionError):
+                    with zju.notification_state(1):
+                        pass
+
     def test_courses_later_page_error_is_not_partial_list(self):
         z = zju.Zju.__new__(zju.Zju)
         pages = [response({"courses": [COURSE], "pages": 2}), response({"error": "boom"}, 500)]

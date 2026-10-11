@@ -236,6 +236,29 @@ class Notifications(unittest.TestCase):
                 zju.cmd_notify(args)  # 没有新事件时不动队列
             self.assertEqual(len(json.loads(box.read_text())), 2)
 
+    def test_outbox_append_waits_for_consumer_lock(self):
+        import threading
+        with tempfile.TemporaryDirectory() as d:
+            box = Path(d) / "out.json"
+            box.write_text("[1]")
+            done = threading.Event()
+            with zju.file_lock(box.with_name("out.json.lock")):
+                t = threading.Thread(target=lambda: (zju.append_outbox(box, [2]), done.set()))
+                t.start()
+                self.assertFalse(done.wait(0.3))  # 推送程序持锁时生产者等待，不会覆盖
+                box.write_text("[]")  # 推送程序在锁内删掉已发送的 1
+            t.join(5)
+            self.assertEqual(json.loads(box.read_text()), [2])
+
+    def test_courses_later_page_error_is_not_partial_list(self):
+        z = zju.Zju.__new__(zju.Zju)
+        pages = [response({"courses": [COURSE], "pages": 2}), response({"error": "boom"}, 500)]
+        with mock.patch.object(z, "ensure"), mock.patch.object(z, "post", side_effect=pages):
+            with self.assertRaises(zju.ZjuError):
+                z.courses()
+        with mock.patch.object(z, "ensure"), mock.patch.object(z, "post", return_value=response({"courses": []})):
+            self.assertEqual(z.courses(), [])
+
     def test_day_subs_error_is_not_an_empty_timetable(self):
         z = zju.Zju.__new__(zju.Zju)
         with mock.patch.object(z, "ensure"), mock.patch.object(z, "bearer", return_value={}):

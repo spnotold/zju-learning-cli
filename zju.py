@@ -46,7 +46,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 
@@ -371,8 +371,14 @@ class Zju:
                                "classify_type": "recently_started", "display_studio_list": False},
                 "showScorePassedStatus": False,
             }), "my-courses")
-            out += j.get("courses", [])
-            if page >= j.get("pages", 1):
+            # 后续页出错也是 JSON：不能当成"课程到此为止"，否则 notify 会漏查后面的课
+            if not isinstance(j, dict) or not isinstance(j.get("courses"), list):
+                raise ZjuError(f"课程列表第 {page} 页查询失败：{str(j)[:200]}")
+            pages = j.get("pages", 1)
+            if not isinstance(pages, int):
+                raise ZjuError(f"课程列表第 {page} 页分页信息无效：{pages!r}")
+            out += j["courses"]
+            if page >= pages:
                 return out
             page += 1
 
@@ -927,21 +933,36 @@ def assessment_notifications(course: dict, rows: list[dict], seen: dict, now: dt
     return events
 
 
-def append_outbox(path: Path, events: list[dict]):
-    """追加到外部推送程序的待发送队列（JSON 数组，原子写入）；推送成功后由推送程序删除。"""
-    try:
-        queue = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        queue = []
-    except ValueError as e:
-        raise ZjuError(f"待发送队列 {path} 格式错误，请备份后移走再运行") from e
-    if not isinstance(queue, list):
-        raise ZjuError(f"待发送队列 {path} 格式错误，请备份后移走再运行")
-    path.parent.mkdir(parents=True, exist_ok=True)
+@contextmanager
+def file_lock(path: Path, wait: bool = True):
+    """进程间互斥锁（flock／msvcrt）；wait=False 时拿不到锁抛 OSError。"""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "r+b") as lock:
+        if sys.platform == "win32":
+            import msvcrt
+            if not os.fstat(lock.fileno()).st_size:
+                lock.write(b"\0")
+                lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK if wait else msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            yield
+        finally:
+            if sys.platform == "win32":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def write_json_atomic(path: Path, data):
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(queue + events, f, ensure_ascii=False, indent=1)
+            json.dump(data, f, ensure_ascii=False, indent=1)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
@@ -949,56 +970,47 @@ def append_outbox(path: Path, events: list[dict]):
         Path(tmp).unlink(missing_ok=True)
 
 
+def append_outbox(path: Path, events: list[dict]):
+    """追加到外部推送程序的待发送队列（JSON 数组，原子写入）；推送成功后由推送程序删除。
+    读改写全程持有 <队列文件>.lock，推送程序删除已发送事件时也要拿同一把锁。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(path.with_name(path.name + ".lock")):
+        try:
+            queue = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            queue = []
+        except ValueError as e:
+            raise ZjuError(f"待发送队列 {path} 格式错误，请备份后移走再运行") from e
+        if not isinstance(queue, list):
+            raise ZjuError(f"待发送队列 {path} 格式错误，请备份后移走再运行")
+        write_json_atomic(path, queue + events)
+
+
 @contextmanager
 def notification_state(user_id: int):
     """按用户隔离，进程锁防止定时任务重叠；输出成功后原子保存。"""
     path = state_dir() / f"notifications-{user_id}.json"
-    fd = os.open(path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT, 0o600)
-    with os.fdopen(fd, "r+b") as lock:
+    with ExitStack() as stack:
         try:
-            if sys.platform == "win32":
-                import msvcrt
-                if not os.fstat(lock.fileno()).st_size:
-                    lock.write(b"\0")
-                    lock.flush()
-                lock.seek(0)
-                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            stack.enter_context(file_lock(path.with_suffix(".lock"), wait=False))
         except OSError as e:
             raise ZjuError("另一个 notify 正在运行，请等它结束后重试") from e
         try:
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except FileNotFoundError:
-                data = {"version": 1, "items": {}}
-            except ValueError as e:
-                raise ZjuError(f"通知记录 {path} 格式错误，请备份后移走再运行") from e
-            if (not isinstance(data, dict) or data.get("version") != 1
-                    or not isinstance(data.get("items"), dict)
-                    or any(not isinstance(v, dict) or not isinstance(v.get("status"), str)
-                           or v["status"] not in ASSESSMENT_STATUSES
-                           or any(k not in v or (v[k] is not None and not isinstance(v[k], str))
-                                  for k in ("start_time", "end_time", "due_end"))
-                           for v in data["items"].values())):
-                raise ZjuError(f"通知记录 {path} 格式错误，请备份后移走再运行")
-            yield data["items"]
-            fd, tmp = tempfile.mkstemp(prefix=".notifications-", dir=path.parent)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=1)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp, path)
-            finally:
-                Path(tmp).unlink(missing_ok=True)
-        finally:
-            if sys.platform == "win32":
-                lock.seek(0)
-                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(lock, fcntl.LOCK_UN)
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            data = {"version": 1, "items": {}}
+        except ValueError as e:
+            raise ZjuError(f"通知记录 {path} 格式错误，请备份后移走再运行") from e
+        if (not isinstance(data, dict) or data.get("version") != 1
+                or not isinstance(data.get("items"), dict)
+                or any(not isinstance(v, dict) or not isinstance(v.get("status"), str)
+                       or v["status"] not in ASSESSMENT_STATUSES
+                       or any(k not in v or (v[k] is not None and not isinstance(v[k], str))
+                              for k in ("start_time", "end_time", "due_end"))
+                       for v in data["items"].values())):
+            raise ZjuError(f"通知记录 {path} 格式错误，请备份后移走再运行")
+        yield data["items"]
+        write_json_atomic(path, data)
 
 
 def read_body(a) -> str:
